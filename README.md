@@ -20,6 +20,7 @@ Copy-Item .\config.example.json .\config.json
 - `display_currency`：建议保持 `auto`。如果令牌不是 Root 权限，脚本无法读取系统配置，会使用本地配置的默认金额口径。
 - `report_base_url`：HTML 报表公开访问目录。Nginx 如果把域名路径转发到 `reports` 目录，就填对应 URL，例如 `https://report.example.com/newapi/`。
 - `request_delay_seconds`：每次接口请求之间的最小间隔，默认 `0.5` 秒，用于避免分页读取消费日志时触发限流。
+- `api_rate_limit_max_requests` / `api_rate_limit_window_seconds`：客户端滑动窗口限速，默认 `180` 秒内最多 `150` 次请求。new-api 默认全局 API 限流通常是 `180` 秒 `180` 次，脚本默认保留 30 次余量给其他后台请求。
 - `max_retries`：遇到 HTTP 429/5xx 等临时错误时的最大重试次数，默认 `6`。
 - `retry_base_seconds` / `retry_max_seconds`：指数退避重试等待时间，遇到服务端 `Retry-After` 会优先使用服务端建议。
 
@@ -35,6 +36,8 @@ Copy-Item .\config.example.json .\config.json
   "display_currency": "auto",
   "report_base_url": "https://report.example.com/newapi/",
   "request_delay_seconds": 0.5,
+  "api_rate_limit_max_requests": 150,
+  "api_rate_limit_window_seconds": 180,
   "max_retries": 6,
   "sites": [
     {
@@ -106,4 +109,6 @@ HTML详情：https://report.example.com/newapi/newapi-daily-2026-06-13.html
 
 如果消费日志关闭，今日消耗人数和消耗排行可能偏低或为空；脚本会在异常提示中说明。
 
-如果某个站点消费日志很多，分页过程中触发 HTTP 429，脚本会自动等待并重试。重试仍失败时，不会让整个站点日报失败；脚本会使用已拉取到的消费日志计算排行，并在简报/HTML 的提示中说明排行可能不完整。
+脚本默认会按 `180` 秒最多 `150` 次请求主动限速，适配 new-api 默认全局 API 限流。请求量大时生成时间会变长，这是为了避免触发服务端 HTTP 429。
+
+如果某个站点消费日志很多，分页过程中仍触发 HTTP 429，脚本会自动等待并重试。重试仍失败时，不会让整个站点日报失败；脚本会使用已拉取到的消费日志计算排行，并在简报/HTML 的提示中说明排行可能不完整。

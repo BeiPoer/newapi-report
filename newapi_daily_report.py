@@ -20,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from collections import deque
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -62,6 +63,8 @@ class SiteConfig:
     custom_currency_exchange_rate: float = 1.0
     timeout_seconds: int = 30
     request_delay_seconds: float = 0.5
+    api_rate_limit_max_requests: int = 150
+    api_rate_limit_window_seconds: float = 180.0
     max_retries: int = 6
     retry_base_seconds: float = 2.0
     retry_max_seconds: float = 60.0
@@ -80,6 +83,8 @@ class AppConfig:
     custom_currency_exchange_rate: float = 1.0
     timeout_seconds: int = 30
     request_delay_seconds: float = 0.5
+    api_rate_limit_max_requests: int = 150
+    api_rate_limit_window_seconds: float = 180.0
     max_retries: int = 6
     retry_base_seconds: float = 2.0
     retry_max_seconds: float = 60.0
@@ -221,6 +226,8 @@ def load_config(path: Path) -> AppConfig:
             custom_currency_exchange_rate=float(raw.get("custom_currency_exchange_rate", 1.0)),
             timeout_seconds=int(raw.get("timeout_seconds", 30)),
             request_delay_seconds=float(raw.get("request_delay_seconds", 0.5)),
+            api_rate_limit_max_requests=int(raw.get("api_rate_limit_max_requests", 150)),
+            api_rate_limit_window_seconds=float(raw.get("api_rate_limit_window_seconds", 180.0)),
             max_retries=int(raw.get("max_retries", 6)),
             retry_base_seconds=float(raw.get("retry_base_seconds", 2.0)),
             retry_max_seconds=float(raw.get("retry_max_seconds", 60.0)),
@@ -260,6 +267,12 @@ def load_config(path: Path) -> AppConfig:
                     ),
                     timeout_seconds=int(raw_site.get("timeout_seconds", app_config.timeout_seconds)),
                     request_delay_seconds=float(raw_site.get("request_delay_seconds", app_config.request_delay_seconds)),
+                    api_rate_limit_max_requests=int(
+                        raw_site.get("api_rate_limit_max_requests", app_config.api_rate_limit_max_requests)
+                    ),
+                    api_rate_limit_window_seconds=float(
+                        raw_site.get("api_rate_limit_window_seconds", app_config.api_rate_limit_window_seconds)
+                    ),
                     max_retries=int(raw_site.get("max_retries", app_config.max_retries)),
                     retry_base_seconds=float(raw_site.get("retry_base_seconds", app_config.retry_base_seconds)),
                     retry_max_seconds=float(raw_site.get("retry_max_seconds", app_config.retry_max_seconds)),
@@ -333,6 +346,7 @@ class NewApiClient:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._last_request_at = 0.0
+        self._request_timestamps: deque[float] = deque()
 
     def get(self, path: str, params: dict[str, Any] | None = None, *, allow_failure: bool = False) -> Any:
         url = self._build_url(path, params)
@@ -408,14 +422,33 @@ class NewApiClient:
         return f"{self.config.base_url}{path}{query}"
 
     def _throttle(self) -> None:
+        self._enforce_window_rate_limit()
         delay = max(0.0, self.config.request_delay_seconds)
-        if delay <= 0:
-            return
-        now = time.monotonic()
-        wait_seconds = delay - (now - self._last_request_at)
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
+        if delay > 0:
+            now = time.monotonic()
+            wait_seconds = delay - (now - self._last_request_at)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
         self._last_request_at = time.monotonic()
+        self._request_timestamps.append(self._last_request_at)
+
+    def _enforce_window_rate_limit(self) -> None:
+        max_requests = self.config.api_rate_limit_max_requests
+        window_seconds = self.config.api_rate_limit_window_seconds
+        if max_requests <= 0 or window_seconds <= 0:
+            return
+        while True:
+            now = time.monotonic()
+            cutoff = now - window_seconds
+            while self._request_timestamps and self._request_timestamps[0] <= cutoff:
+                self._request_timestamps.popleft()
+            if len(self._request_timestamps) < max_requests:
+                return
+            wait_seconds = self._request_timestamps[0] + window_seconds - now + 0.25
+            if wait_seconds <= 0:
+                continue
+            self._log_rate_limit_wait(wait_seconds, max_requests, window_seconds)
+            time.sleep(wait_seconds)
 
     def _retry_wait_seconds(self, attempt: int, headers: Any) -> float:
         retry_after = parse_retry_after(headers)
@@ -428,6 +461,12 @@ class NewApiClient:
     def _log_retry(self, url: str, reason: Any, attempt: int, max_retries: int, wait_seconds: float) -> None:
         print(
             f"请求触发重试，{wait_seconds:.1f}s 后继续（{attempt}/{max_retries}，原因：{reason}）：{url}",
+            file=sys.stderr,
+        )
+
+    def _log_rate_limit_wait(self, wait_seconds: float, max_requests: int, window_seconds: float) -> None:
+        print(
+            f"达到客户端限速：{window_seconds:g}s 内最多 {max_requests} 次请求，等待 {wait_seconds:.1f}s 后继续。",
             file=sys.stderr,
         )
 
