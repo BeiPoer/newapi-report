@@ -6,6 +6,10 @@
   "custom_currency_symbol": "¤",
   "custom_currency_exchange_rate": 1.0,
   "timeout_seconds": 30,
+  "request_delay_seconds": 0.5,
+  "max_retries": 6,
+  "retry_base_seconds": 2.0,
+  "retry_max_seconds": 60.0,
   "report_base_url": "https://report.example.com/newapi/",
   "sites": [
     {

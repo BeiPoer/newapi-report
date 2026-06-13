@@ -15,11 +15,13 @@ import html
 import json
 import math
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +61,10 @@ class SiteConfig:
     custom_currency_symbol: str = "¤"
     custom_currency_exchange_rate: float = 1.0
     timeout_seconds: int = 30
+    request_delay_seconds: float = 0.5
+    max_retries: int = 6
+    retry_base_seconds: float = 2.0
+    retry_max_seconds: float = 60.0
 
 
 Config = SiteConfig
@@ -73,6 +79,10 @@ class AppConfig:
     custom_currency_symbol: str = "¤"
     custom_currency_exchange_rate: float = 1.0
     timeout_seconds: int = 30
+    request_delay_seconds: float = 0.5
+    max_retries: int = 6
+    retry_base_seconds: float = 2.0
+    retry_max_seconds: float = 60.0
     report_base_url: str = ""
     sites: list[SiteConfig] = field(default_factory=list)
 
@@ -210,6 +220,10 @@ def load_config(path: Path) -> AppConfig:
             custom_currency_symbol=str(raw.get("custom_currency_symbol") or "¤").strip(),
             custom_currency_exchange_rate=float(raw.get("custom_currency_exchange_rate", 1.0)),
             timeout_seconds=int(raw.get("timeout_seconds", 30)),
+            request_delay_seconds=float(raw.get("request_delay_seconds", 0.5)),
+            max_retries=int(raw.get("max_retries", 6)),
+            retry_base_seconds=float(raw.get("retry_base_seconds", 2.0)),
+            retry_max_seconds=float(raw.get("retry_max_seconds", 60.0)),
             report_base_url=str(raw.get("report_base_url") or "").strip(),
         )
     except (TypeError, ValueError) as exc:
@@ -245,6 +259,10 @@ def load_config(path: Path) -> AppConfig:
                         raw_site.get("custom_currency_exchange_rate", app_config.custom_currency_exchange_rate)
                     ),
                     timeout_seconds=int(raw_site.get("timeout_seconds", app_config.timeout_seconds)),
+                    request_delay_seconds=float(raw_site.get("request_delay_seconds", app_config.request_delay_seconds)),
+                    max_retries=int(raw_site.get("max_retries", app_config.max_retries)),
+                    retry_base_seconds=float(raw_site.get("retry_base_seconds", app_config.retry_base_seconds)),
+                    retry_max_seconds=float(raw_site.get("retry_max_seconds", app_config.retry_max_seconds)),
                 )
             )
         except (TypeError, ValueError) as exc:
@@ -314,6 +332,7 @@ def build_runtime_options(args: argparse.Namespace, config: Config) -> RuntimeOp
 class NewApiClient:
     def __init__(self, config: Config) -> None:
         self.config = config
+        self._last_request_at = 0.0
 
     def get(self, path: str, params: dict[str, Any] | None = None, *, allow_failure: bool = False) -> Any:
         url = self._build_url(path, params)
@@ -328,18 +347,37 @@ class NewApiClient:
             },
             method="GET",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-                body = decode_response_body(response.read(), response.headers.get("Content-Encoding", ""))
-        except urllib.error.HTTPError as exc:
-            body = decode_response_body(exc.read(), exc.headers.get("Content-Encoding", ""), errors="replace")
+        retryable_statuses = {408, 429, 500, 502, 503, 504}
+        max_retries = max(0, self.config.max_retries)
+        for attempt in range(max_retries + 1):
+            self._throttle()
+            try:
+                with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+                    body = decode_response_body(response.read(), response.headers.get("Content-Encoding", ""))
+                break
+            except urllib.error.HTTPError as exc:
+                body = decode_response_body(exc.read(), exc.headers.get("Content-Encoding", ""), errors="replace")
+                if exc.code in retryable_statuses and attempt < max_retries:
+                    wait_seconds = self._retry_wait_seconds(attempt, exc.headers)
+                    self._log_retry(url, exc.code, attempt + 1, max_retries, wait_seconds)
+                    time.sleep(wait_seconds)
+                    continue
+                if allow_failure:
+                    return {"success": False, "message": f"HTTP {exc.code}: {body}", "data": None}
+                raise ReportError(f"请求失败：{url}\nHTTP {exc.code}: {body}") from exc
+            except urllib.error.URLError as exc:
+                if attempt < max_retries:
+                    wait_seconds = self._retry_wait_seconds(attempt, None)
+                    self._log_retry(url, "连接错误", attempt + 1, max_retries, wait_seconds)
+                    time.sleep(wait_seconds)
+                    continue
+                if allow_failure:
+                    return {"success": False, "message": str(exc), "data": None}
+                raise ReportError(f"无法连接 new-api：{url}\n{exc}") from exc
+        else:  # pragma: no cover - defensive guard
             if allow_failure:
-                return {"success": False, "message": f"HTTP {exc.code}: {body}", "data": None}
-            raise ReportError(f"请求失败：{url}\nHTTP {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
-            if allow_failure:
-                return {"success": False, "message": str(exc), "data": None}
-            raise ReportError(f"无法连接 new-api：{url}\n{exc}") from exc
+                return {"success": False, "message": "请求失败且未获得响应", "data": None}
+            raise ReportError(f"请求失败且未获得响应：{url}")
 
         try:
             payload = json.loads(body)
@@ -369,16 +407,68 @@ class NewApiClient:
             query = "?" + urllib.parse.urlencode(clean_params)
         return f"{self.config.base_url}{path}{query}"
 
+    def _throttle(self) -> None:
+        delay = max(0.0, self.config.request_delay_seconds)
+        if delay <= 0:
+            return
+        now = time.monotonic()
+        wait_seconds = delay - (now - self._last_request_at)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        self._last_request_at = time.monotonic()
+
+    def _retry_wait_seconds(self, attempt: int, headers: Any) -> float:
+        retry_after = parse_retry_after(headers)
+        if retry_after is not None:
+            return min(max(0.0, retry_after), max(0.0, self.config.retry_max_seconds))
+        base = max(0.1, self.config.retry_base_seconds)
+        delay = base * (2 ** attempt)
+        return min(delay, max(0.1, self.config.retry_max_seconds))
+
+    def _log_retry(self, url: str, reason: Any, attempt: int, max_retries: int, wait_seconds: float) -> None:
+        print(
+            f"请求触发重试，{wait_seconds:.1f}s 后继续（{attempt}/{max_retries}，原因：{reason}）：{url}",
+            file=sys.stderr,
+        )
+
 
 def decode_response_body(body: bytes, content_encoding: str, *, errors: str = "strict") -> str:
+    if not body:
+        return ""
     encoding = (content_encoding or "").lower().strip()
-    if "gzip" in encoding or body.startswith(b"\x1f\x8b"):
-        body = gzip.decompress(body)
-    elif "deflate" in encoding:
-        body = zlib.decompress(body)
-    elif "br" in encoding:
+    if "br" in encoding:
         raise ReportError("接口返回了 Brotli 压缩响应，但脚本只使用标准库；请让反向代理关闭 br 压缩或返回 gzip/identity。")
+    try:
+        if "gzip" in encoding or body.startswith(b"\x1f\x8b"):
+            body = gzip.decompress(body)
+        elif "deflate" in encoding:
+            body = zlib.decompress(body)
+    except (OSError, zlib.error):
+        return body.decode("utf-8", errors=errors)
     return body.decode("utf-8", errors=errors)
+
+
+def parse_retry_after(headers: Any) -> float | None:
+    if headers is None:
+        return None
+    raw = ""
+    try:
+        raw = str(headers.get("Retry-After", "") or "").strip()
+    except AttributeError:
+        raw = ""
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
 
 
 def fetch_page(client: NewApiClient, path: str, page: int, extra_params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -418,6 +508,31 @@ def iter_paged_items(
             break
         page += 1
     return items
+
+
+def iter_paged_items_partial(
+    client: NewApiClient,
+    path: str,
+    extra_params: dict[str, Any] | None = None,
+    *,
+    label: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    items: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    page = 1
+    while True:
+        try:
+            data = fetch_page(client, path, page, extra_params)
+        except ReportError as exc:
+            warnings.append(f"{label}读取到第 {page} 页时失败，已使用前 {format_int(len(items))} 条记录计算排行：{exc}")
+            break
+        page_items = [item for item in data["items"] if isinstance(item, dict)]
+        items.extend(page_items)
+        total = data["total"]
+        if not page_items or page * PAGE_SIZE >= total:
+            break
+        page += 1
+    return items, warnings
 
 
 def parse_int(value: Any, default: int = 0) -> int:
@@ -622,21 +737,24 @@ def fetch_topups(client: NewApiClient, runtime: RuntimeOptions) -> tuple[list[di
 
 def fetch_consume_logs(client: NewApiClient, runtime: RuntimeOptions) -> tuple[list[dict[str, Any]], int, list[str]]:
     warnings: list[str] = []
-    stat_data = client.get(
-        "/api/log/stat",
-        {
-            "type": LOG_TYPE_CONSUME,
-            "start_timestamp": runtime.start_ts,
-            "end_timestamp": runtime.end_ts,
-        },
-    )
     stat_quota = 0
-    if isinstance(stat_data, dict):
-        stat_quota = parse_int(stat_data.get("quota"))
-    else:
-        warnings.append("消费统计接口返回格式异常，今日消耗金额使用消费日志聚合结果。")
+    try:
+        stat_data = client.get(
+            "/api/log/stat",
+            {
+                "type": LOG_TYPE_CONSUME,
+                "start_timestamp": runtime.start_ts,
+                "end_timestamp": runtime.end_ts,
+            },
+        )
+        if isinstance(stat_data, dict):
+            stat_quota = parse_int(stat_data.get("quota"))
+        else:
+            warnings.append("消费统计接口返回格式异常，今日消耗金额使用消费日志聚合结果。")
+    except ReportError as exc:
+        warnings.append(f"消费统计接口读取失败，今日消耗金额使用消费日志聚合结果：{exc}")
 
-    logs = iter_paged_items(
+    logs, log_warnings = iter_paged_items_partial(
         client,
         "/api/log/",
         {
@@ -644,7 +762,9 @@ def fetch_consume_logs(client: NewApiClient, runtime: RuntimeOptions) -> tuple[l
             "start_timestamp": runtime.start_ts,
             "end_timestamp": runtime.end_ts,
         },
+        label="消费日志",
     )
+    warnings.extend(log_warnings)
     log_quota = sum(parse_int(item.get("quota")) for item in logs)
     if stat_quota == 0 and log_quota > 0:
         stat_quota = log_quota
@@ -939,9 +1059,11 @@ def render_site_text_brief(report: SiteReport) -> list[str]:
     lines.append(f"消耗Top3：{format_top_amounts(top_consume_amounts(data), data.money)}")
     if data.warnings:
         lines.append("")
-        lines.append("提示")
-        for warning in data.warnings:
-            lines.append(f"- {warning}")
+        if len(data.warnings) == 1:
+            lines.append(f"提示：{data.warnings[0]}")
+        else:
+            for index, warning in enumerate(data.warnings, start=1):
+                lines.append(f"提示{index}：{warning}")
     return lines
 
 
@@ -1411,9 +1533,9 @@ def main() -> int:
         print(text_brief)
         print("生成文件：")
         if text_path:
-            print(f"- 文字简报：{text_path}")
+            print(f"文字简报：{text_path}")
         if html_path:
-            print(f"- HTML：{html_path}")
+            print(f"HTML：{html_path}")
         return 0
     except ReportError as exc:
         print(f"错误：{exc}", file=sys.stderr)
