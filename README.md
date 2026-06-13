@@ -81,6 +81,13 @@ uv run .\newapi_daily_report.py
 生成指定日期日报：
 
 ```powershell
+uv run .\newapi_daily_report.py 20260613
+```
+
+也可以使用横杠日期或 `--date`：
+
+```powershell
+uv run .\newapi_daily_report.py 2026-06-13
 uv run .\newapi_daily_report.py --date 2026-06-13
 ```
 

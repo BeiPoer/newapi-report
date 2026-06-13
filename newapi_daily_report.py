@@ -181,13 +181,18 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
+        "date_arg",
+        nargs="?",
+        help="统计日期，支持 YYYYMMDD 或 YYYY-MM-DD。例如 20260613。",
+    )
+    parser.add_argument(
         "--config",
         default=str(Path(__file__).with_name("config.json")),
         help="配置文件路径。",
     )
     parser.add_argument(
         "--date",
-        help="统计日期，格式 YYYY-MM-DD。默认使用配置时区下的今天。",
+        help="统计日期，支持 YYYYMMDD 或 YYYY-MM-DD。默认使用配置时区下的今天。",
     )
     parser.add_argument(
         "--output-dir",
@@ -206,6 +211,18 @@ def parse_args() -> argparse.Namespace:
         help="只验证配置和接口权限，不生成日报。",
     )
     return parser.parse_args()
+
+
+def parse_report_date(value: str, source: str = "日期") -> dt.date:
+    text = str(value or "").strip()
+    if not text:
+        raise ReportError(f"{source}不能为空。")
+    if len(text) == 8 and text.isdigit():
+        text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError as exc:
+        raise ReportError(f"{source}格式必须是 YYYYMMDD 或 YYYY-MM-DD，例如 20260613。") from exc
 
 
 def load_config(path: Path) -> AppConfig:
@@ -318,11 +335,16 @@ def get_timezone(name: str) -> dt.tzinfo:
 def build_runtime_options(args: argparse.Namespace, config: Config) -> RuntimeOptions:
     tz = get_timezone(config.timezone)
     now = dt.datetime.now(tz)
-    if args.date:
-        try:
-            target_date = dt.date.fromisoformat(args.date)
-        except ValueError as exc:
-            raise ReportError("--date 格式必须是 YYYY-MM-DD") from exc
+    if args.date and args.date_arg:
+        cli_date = parse_report_date(args.date_arg, "位置日期参数")
+        option_date = parse_report_date(args.date, "--date")
+        if cli_date != option_date:
+            raise ReportError("位置日期参数和 --date 指定了不同日期，请只保留一个。")
+        target_date = cli_date
+    elif args.date_arg:
+        target_date = parse_report_date(args.date_arg, "位置日期参数")
+    elif args.date:
+        target_date = parse_report_date(args.date, "--date")
     else:
         target_date = now.date()
 
