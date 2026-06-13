@@ -101,11 +101,11 @@ HTML详情：https://report.example.com/newapi/newapi-daily-2026-06-13.html
 
 ## 数据口径
 
-- 今日充值：成功订单 `status == success`，按 `complete_time` 归属统计日期。
+- 今日充值：支付类充值按成功订单 `status == success` 和 `complete_time` 归属统计日期；兑换码充值按已使用兑换码的 `redeemed_time` 归属统计日期。
 - 今日消耗：消费日志 `type=2`，消耗金额由 `quota / QuotaPerUnit` 折算。
 - 消耗排行 Top 10：按用户聚合今日消费 `quota` 后排序，同 quota 时按请求次数降序，再按用户 ID 升序。
 - 今日新增注册：用户 `created_at` 落在统计日期内。
-- 历史总充值：当前接口可拉取到的全部成功充值订单按用户聚合。
+- 历史总充值：当前接口可拉取到的全部成功支付订单和已使用兑换码按用户聚合。
 
 如果消费日志关闭，今日消耗人数和消耗排行可能偏低或为空；脚本会在异常提示中说明。
 

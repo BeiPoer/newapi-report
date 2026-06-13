@@ -38,6 +38,7 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_DISPLAY_CURRENCY = "CNY"
 PAGE_SIZE = 100
 LOG_TYPE_CONSUME = 2
+REDEMPTION_STATUS_USED = 3
 TOP_N = 10
 
 for stream in (sys.stdout, sys.stderr):
@@ -155,6 +156,8 @@ class ReportData:
     today_new_users: list[UserInfo]
     all_success_topups: list[dict[str, Any]]
     today_success_topups: list[dict[str, Any]]
+    all_used_redemptions: list[dict[str, Any]]
+    today_used_redemptions: list[dict[str, Any]]
     recharge_users: list[RechargeUserStats]
     today_consume_logs: list[dict[str, Any]]
     consume_users: list[ConsumeUserStats]
@@ -563,7 +566,7 @@ def iter_paged_items_partial(
         try:
             data = fetch_page(client, path, page, extra_params)
         except ReportError as exc:
-            warnings.append(f"{label}读取到第 {page} 页时失败，已使用前 {format_int(len(items))} 条记录计算排行：{exc}")
+            warnings.append(f"{label}读取到第 {page} 页时失败，已使用前 {format_int(len(items))} 条记录继续生成报表：{exc}")
             break
         page_items = [item for item in data["items"] if isinstance(item, dict)]
         items.extend(page_items)
@@ -729,6 +732,17 @@ def topup_display_amount(topup: dict[str, Any], settings: MoneySettings) -> floa
     return amount
 
 
+def redemption_user_id(redemption: dict[str, Any]) -> int:
+    user_id = parse_int(redemption.get("used_user_id"))
+    if user_id <= 0:
+        user_id = parse_int(redemption.get("user_id"))
+    return user_id
+
+
+def redemption_display_amount(redemption: dict[str, Any], settings: MoneySettings) -> float:
+    return quota_to_display_amount(parse_int(redemption.get("quota")), settings)
+
+
 def is_today_timestamp(timestamp: int, runtime: RuntimeOptions) -> bool:
     return runtime.start_ts <= timestamp <= runtime.end_ts
 
@@ -772,6 +786,24 @@ def fetch_topups(client: NewApiClient, runtime: RuntimeOptions) -> tuple[list[di
         if is_today_timestamp(complete_time, runtime):
             today_topups.append(item)
     return success_topups, today_topups
+
+
+def fetch_redemptions(client: NewApiClient, runtime: RuntimeOptions) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    raw_redemptions, warnings = iter_paged_items_partial(client, "/api/redemption/", label="兑换码")
+    used_redemptions: list[dict[str, Any]] = []
+    today_redemptions: list[dict[str, Any]] = []
+    for item in raw_redemptions:
+        if parse_int(item.get("status")) != REDEMPTION_STATUS_USED:
+            continue
+        redeemed_time = parse_int(item.get("redeemed_time"))
+        user_id = redemption_user_id(item)
+        quota = parse_int(item.get("quota"))
+        if redeemed_time <= 0 or user_id <= 0 or quota <= 0:
+            continue
+        used_redemptions.append(item)
+        if is_today_timestamp(redeemed_time, runtime):
+            today_redemptions.append(item)
+    return used_redemptions, today_redemptions, warnings
 
 
 def fetch_consume_logs(client: NewApiClient, runtime: RuntimeOptions) -> tuple[list[dict[str, Any]], int, list[str]]:
@@ -818,9 +850,11 @@ def fetch_consume_logs(client: NewApiClient, runtime: RuntimeOptions) -> tuple[l
 def aggregate_recharge_users(
     success_topups: list[dict[str, Any]],
     today_topups: list[dict[str, Any]],
+    used_redemptions: list[dict[str, Any]],
+    today_redemptions: list[dict[str, Any]],
     settings: MoneySettings,
 ) -> list[RechargeUserStats]:
-    historical_amounts = aggregate_historical_recharge_amounts(success_topups, settings)
+    historical_amounts = aggregate_historical_recharge_amounts(success_topups, used_redemptions, settings)
     stats: dict[int, RechargeUserStats] = {}
     for user_id, amount in historical_amounts.items():
         item = stats.setdefault(user_id, RechargeUserStats(user_id=user_id))
@@ -840,6 +874,18 @@ def aggregate_recharge_users(
         if safe_text(topup.get("payment_provider")):
             item.providers.add(safe_text(topup.get("payment_provider")))
 
+    for redemption in today_redemptions:
+        user_id = redemption_user_id(redemption)
+        if user_id <= 0:
+            continue
+        item = stats.setdefault(user_id, RechargeUserStats(user_id=user_id))
+        amount = redemption_display_amount(redemption, settings)
+        item.today_amount += amount
+        item.today_count += 1
+        item.latest_complete_time = max(item.latest_complete_time, parse_int(redemption.get("redeemed_time")))
+        item.methods.add("兑换码")
+        item.providers.add("redemption")
+
     today_users = [item for item in stats.values() if item.today_count > 0]
     today_users.sort(key=lambda item: (-item.today_amount, item.user_id))
     return today_users
@@ -847,6 +893,7 @@ def aggregate_recharge_users(
 
 def aggregate_historical_recharge_amounts(
     success_topups: list[dict[str, Any]],
+    used_redemptions: list[dict[str, Any]],
     settings: MoneySettings,
 ) -> dict[int, float]:
     amounts: dict[int, float] = {}
@@ -855,6 +902,11 @@ def aggregate_historical_recharge_amounts(
         if user_id <= 0:
             continue
         amounts[user_id] = amounts.get(user_id, 0.0) + topup_display_amount(topup, settings)
+    for redemption in used_redemptions:
+        user_id = redemption_user_id(redemption)
+        if user_id <= 0:
+            continue
+        amounts[user_id] = amounts.get(user_id, 0.0) + redemption_display_amount(redemption, settings)
     return amounts
 
 
@@ -886,10 +938,12 @@ def build_report_data(client: NewApiClient, config: Config, runtime: RuntimeOpti
 
     users, today_new_users = fetch_users(client, runtime)
     success_topups, today_topups = fetch_topups(client, runtime)
+    used_redemptions, today_redemptions, redemption_warnings = fetch_redemptions(client, runtime)
+    warnings.extend(redemption_warnings)
     consume_logs, stat_quota, consume_warnings = fetch_consume_logs(client, runtime)
     warnings.extend(consume_warnings)
 
-    recharge_users = aggregate_recharge_users(success_topups, today_topups, money)
+    recharge_users = aggregate_recharge_users(success_topups, today_topups, used_redemptions, today_redemptions, money)
     consume_users = aggregate_consume_users(consume_logs)
     consume_top10 = consume_users[:TOP_N]
 
@@ -909,6 +963,8 @@ def build_report_data(client: NewApiClient, config: Config, runtime: RuntimeOpti
         today_new_users=today_new_users,
         all_success_topups=success_topups,
         today_success_topups=today_topups,
+        all_used_redemptions=used_redemptions,
+        today_used_redemptions=today_redemptions,
         recharge_users=recharge_users,
         today_consume_logs=consume_logs,
         consume_users=consume_users,
@@ -1048,7 +1104,7 @@ def build_insights(data: ReportData) -> list[str]:
 def build_kpis(data: ReportData) -> dict[str, Any]:
     total_recharge = sum(item.today_amount for item in data.recharge_users)
     recharge_people = len(data.recharge_users)
-    recharge_count = len(data.today_success_topups)
+    recharge_count = len(data.today_success_topups) + len(data.today_used_redemptions)
     avg_recharge = total_recharge / recharge_people if recharge_people else 0.0
     total_consume_amount = quota_to_display_amount(data.stat_quota, data.money)
     consume_people = len(data.consume_users)
@@ -1149,7 +1205,11 @@ def render_site_html_block(report: SiteReport) -> str:
     kpis = build_kpis(data)
     insights = build_insights(data)
     recharge_by_user = {item.user_id: item for item in data.recharge_users}
-    historical_by_user = aggregate_historical_recharge_amounts(data.all_success_topups, data.money)
+    historical_by_user = aggregate_historical_recharge_amounts(
+        data.all_success_topups,
+        data.all_used_redemptions,
+        data.money,
+    )
 
     kpi_cards = [
         ("总充值金额", format_money(kpis["total_recharge"], data.money)),
@@ -1248,7 +1308,7 @@ def render_site_html_block(report: SiteReport) -> str:
                 <th class="num">历史总充值金额</th>
                 <th class="num">今日充值笔数</th>
                 <th>最近充值时间</th>
-                <th>支付方式</th>
+                <th>来源/支付方式</th>
               </tr>
             </thead>
             <tbody>{recharge_rows}</tbody>
@@ -1297,8 +1357,9 @@ def render_site_html_block(report: SiteReport) -> str:
           金额展示口径：{esc(data.money.display_currency)}，
           QuotaPerUnit={esc(f'{data.money.quota_per_unit:g}')}，
           USDExchangeRate={esc(f'{data.money.usd_exchange_rate:g}')}。
-          今日充值按成功订单 complete_time 归属统计日期；今日消耗按消费日志 type=2 聚合；
-          历史总充值金额基于当前接口可拉取到的全部成功充值订单聚合。
+          今日充值按成功支付订单 complete_time 和已使用兑换码 redeemed_time 归属统计日期；
+          今日消耗按消费日志 type=2 聚合；
+          历史总充值金额基于当前接口可拉取到的全部成功支付订单和已使用兑换码聚合。
         </p>
       </section>
     </article>"""
