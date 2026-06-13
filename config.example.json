@@ -1,0 +1,24 @@
+{
+  "timezone": "Asia/Shanghai",
+  "quota_per_unit": 500000,
+  "usd_exchange_rate": 7.3,
+  "display_currency": "auto",
+  "custom_currency_symbol": "¤",
+  "custom_currency_exchange_rate": 1.0,
+  "timeout_seconds": 30,
+  "report_base_url": "https://report.example.com/newapi/",
+  "sites": [
+    {
+      "name": "主站",
+      "base_url": "http://127.0.0.1:3000",
+      "access_token": "填写主站后台生成的系统访问令牌",
+      "user_id": "填写主站令牌所属用户ID"
+    },
+    {
+      "name": "备用站",
+      "base_url": "http://127.0.0.1:3001",
+      "access_token": "填写备用站后台生成的系统访问令牌",
+      "user_id": "填写备用站令牌所属用户ID"
+    }
+  ]
+}
